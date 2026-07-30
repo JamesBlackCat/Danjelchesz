@@ -90,46 +90,75 @@ S.ignoreList      = {}
 S.aimlockPartChain = { "Head", "UpperTorso", "Torso", "HumanoidRootPart" }
 
 -- ============================================================
---  NPC CACHE  (background-rebuilt every 0.5 s — never blocks rendering)
+--  NPC CACHE  (event-driven — zero polling, zero GetDescendants spam)
 -- ============================================================
---  npcCache[model] = true  for every living non-player Humanoid model.
---  A task.spawn loop rebuilds the table in a separate coroutine every 0.5 s
---  so workspace:GetDescendants() never runs on the render thread.
---  Walking up the parent chain (not just obj.Parent) catches NPCs whose
---  Humanoid is nested more than one level inside their model.
+--  npcCache[model] = { root=BasePart, hum=Humanoid }
+--  Populated once at load via a single GetDescendants scan, then kept
+--  current through workspace.DescendantAdded/Removing events and
+--  Humanoid.Died signals.  No repeated scanning — the 0.5 s spike is gone.
+--  root is cached so the ESP loop never calls FindFirstChildWhichIsA.
 -- ============================================================
-local npcCache = {}      -- [Model] = true
+local npcCache       = {}   -- [Model] = { root=BasePart, hum=Humanoid }
+local playerCharsSet = {}   -- set of current player character models
 
-local function rebuildNPCCache()
-    local playerChars = {}
-    for _, p in ipairs(Players:GetPlayers()) do
-        if p.Character then playerChars[p.Character] = true end
-    end
-    local fresh = {}
-    for _, obj in ipairs(workspace:GetDescendants()) do
-        if obj:IsA("Humanoid") and obj.Health > 0 then
-            -- Walk up to find the nearest Model ancestor (handles nested rigs)
-            local model = obj.Parent
-            while model and not model:IsA("Model") do
-                model = model.Parent
-            end
-            if model and model ~= workspace and not playerChars[model] then
-                fresh[model] = true
-            end
-        end
-    end
-    npcCache = fresh
+-- Track all player characters so we never add them to npcCache
+local function trackPlayer(p)
+    p.CharacterAdded:Connect(function(c)   playerCharsSet[c] = true  end)
+    p.CharacterRemoving:Connect(function(c) playerCharsSet[c] = nil  end)
+    if p.Character then playerCharsSet[p.Character] = true end
+end
+for _, p in ipairs(Players:GetPlayers()) do trackPlayer(p) end
+Players.PlayerAdded:Connect(trackPlayer)
+Players.PlayerRemoving:Connect(function(p)
+    if p.Character then playerCharsSet[p.Character] = nil end
+end)
+
+local function getModelRoot(model)
+    return model.PrimaryPart
+        or model:FindFirstChild("HumanoidRootPart")
+        or model:FindFirstChildWhichIsA("BasePart")
 end
 
-rebuildNPCCache()   -- initial synchronous build at load time
+local function tryAddNPC(model)
+    if not model or not model:IsA("Model") or model == workspace then return end
+    if playerCharsSet[model] then return end
+    if npcCache[model] then return end
+    local hum = model:FindFirstChildWhichIsA("Humanoid")
+    if not hum or hum.Health <= 0 then return end
+    local root = getModelRoot(model)
+    if not root then return end
+    npcCache[model] = { root = root, hum = hum }
+    -- Remove entry the instant the NPC dies (no lag, no polling)
+    hum.Died:Connect(function() npcCache[model] = nil end)
+end
 
--- Subsequent rebuilds run in a background coroutine every 0.5 s
-task.spawn(function()
-    while true do
-        task.wait(0.5)
-        rebuildNPCCache()
+-- ── Initial one-time scan (runs only at script load) ─────────
+for _, obj in ipairs(workspace:GetDescendants()) do
+    if obj:IsA("Humanoid") then
+        local m = obj.Parent
+        while m and not m:IsA("Model") do m = m.Parent end
+        tryAddNPC(m)
+    end
+end
+
+-- ── Event: new Humanoid spawned anywhere in workspace ─────────
+workspace.DescendantAdded:Connect(function(obj)
+    if not obj:IsA("Humanoid") then return end
+    -- defer so the rig is fully parented/initialized before we inspect it
+    task.defer(function()
+        local m = obj.Parent
+        while m and not m:IsA("Model") do m = m.Parent end
+        if m and not playerCharsSet[m] then tryAddNPC(m) end
+    end)
+end)
+
+-- ── Event: Model removed from workspace ───────────────────────
+workspace.DescendantRemoving:Connect(function(obj)
+    if obj:IsA("Model") and npcCache[obj] then
+        npcCache[obj] = nil
     end
 end)
+
 
 -- ============================================================
 --  AIMLOCK STATE
@@ -418,15 +447,33 @@ local function switchTarget(dir)
 end
 
 -- ============================================================
---  NPC ESP  (BillboardGui square — auto-follows NPC in 3D)
+--  NPC ESP  (BillboardGui square — see-through-walls, Heartbeat-driven)
 -- ============================================================
---  espBoxes[model] = { gui = BillboardGui, frame = Frame, lbl = TextLabel }
---  BillboardGui is parented to the NPC root so it auto-follows and auto-
---  destroys if the NPC's root is removed from the game.
---  updateESPBoxes() runs from BindToRenderStep — lazy-creates GUIs on first
---  in-range frame, hides on out-of-range, destroys on death or cache eviction.
+--  espBoxes[model] = { gui=BillboardGui, frame=Frame, lbl=TextLabel }
+--  BillboardGui is parented to the cached NPC root part so it auto-
+--  follows in 3D and auto-destroys when the root leaves the game.
+--  updateESPBoxes() runs on RunService.Heartbeat at ~10 fps — never
+--  on BindToRenderStep — so it cannot cause render-thread frame drops.
 -- ============================================================
 local espBoxes = {}
+
+-- Cached Color3 so Color3.fromRGB() is not called every tick
+local _espColorR, _espColorG, _espColorB = -1, -1, -1
+local _espCachedColor = Color3.fromRGB(255, 50, 50)
+
+local function getESPColor()
+    local r, g, b = S.espBoxColorR, S.espBoxColorG, S.espBoxColorB
+    if r ~= _espColorR or g ~= _espColorG or b ~= _espColorB then
+        _espCachedColor  = Color3.fromRGB(r, g, b)
+        _espColorR, _espColorG, _espColorB = r, g, b
+        -- Propagate new color to all already-created boxes immediately
+        for _, e in pairs(espBoxes) do
+            if e.frame then e.frame.BackgroundColor3 = _espCachedColor end
+            if e.lbl   then e.lbl.TextColor3         = _espCachedColor end
+        end
+    end
+    return _espCachedColor
+end
 
 local function removeESPBox(model)
     local e = espBoxes[model]
@@ -434,6 +481,143 @@ local function removeESPBox(model)
     if e.gui then pcall(function() e.gui:Destroy() end) end
     espBoxes[model] = nil
 end
+
+local function clearAllESPBoxes()
+    for model in pairs(espBoxes) do
+        removeESPBox(model)
+    end
+end
+
+-- Creation queue — BillboardGuis are built here, then handed to the loop
+local _espCreateQueue = {}   -- list of models waiting for GUI creation
+
+local function flushCreateQueue(budget)
+    local count = 0
+    local boxSz   = math.max(8, S.espBoxSize)
+    local boxCol  = getESPColor()
+    local showTag = S.espNameTag == true
+    local LABEL_H = 18
+
+    for i = #_espCreateQueue, 1, -1 do
+        local model = _espCreateQueue[i]
+        table.remove(_espCreateQueue, i)
+
+        -- Model may have died between queue and flush — skip if so
+        local data = npcCache[model]
+        if data and data.root and data.root.Parent and not espBoxes[model] then
+            local root = data.root
+
+            local gui = Instance.new("BillboardGui")
+            gui.Name             = "NPC_ESP"
+            gui.Size             = UDim2.new(0, boxSz, 0, boxSz + LABEL_H)
+            gui.StudsOffset      = Vector3.new(0, 3.5, 0)
+            gui.AlwaysOnTop      = true    -- renders through walls
+            gui.ResetOnSpawn     = false
+            gui.ClipsDescendants = false
+            gui.Enabled          = true
+            gui.Parent           = root
+
+            local lbl = Instance.new("TextLabel")
+            lbl.Name                   = "NameTag"
+            lbl.Size                   = UDim2.new(1, 0, 0, LABEL_H)
+            lbl.Position               = UDim2.new(0, 0, 0, 0)
+            lbl.BackgroundTransparency = 1
+            lbl.Text                   = model.Name
+            lbl.TextColor3             = boxCol
+            lbl.TextScaled             = true
+            lbl.Font                   = Enum.Font.GothamBold
+            lbl.TextStrokeTransparency = 0.3
+            lbl.Visible                = showTag
+            lbl.Parent                 = gui
+
+            local frame = Instance.new("Frame")
+            frame.Name             = "ESPSquare"
+            frame.Size             = UDim2.new(1, 0, 0, boxSz)
+            frame.Position         = UDim2.new(0, 0, 0, LABEL_H)
+            frame.BackgroundColor3 = boxCol
+            frame.BorderSizePixel  = 0
+            frame.Parent           = gui
+
+            -- Black outline — fixed color, not adjustable
+            local stroke = Instance.new("UIStroke")
+            stroke.Color     = Color3.fromRGB(0, 0, 0)
+            stroke.Thickness = 2
+            stroke.Parent    = frame
+
+            espBoxes[model] = { gui = gui, frame = frame, lbl = lbl }
+
+            count = count + 1
+            if count >= budget then break end
+        end
+    end
+end
+
+-- Called on Heartbeat at ~10 fps — never on BindToRenderStep
+local function updateESPBoxes()
+    if not S.espEnabled then
+        -- Turn off: disable all GUIs and clear the creation queue
+        for _, e in pairs(espBoxes) do
+            if e.gui then e.gui.Enabled = false end
+        end
+        _espCreateQueue = {}
+        return
+    end
+
+    local _, hrp = getCharParts()
+    if not hrp then return end
+
+    local range2   = S.espDistance * S.espDistance
+    local hPos     = hrp.Position
+    local boxCol   = getESPColor()
+    local showTag  = S.espNameTag == true
+
+    -- ── Flush up to 3 pending GUI creations per tick ─────────
+    flushCreateQueue(3)
+
+    -- ── Range + visibility pass over the NPC cache ────────────
+    for model, data in pairs(npcCache) do
+        local root = data.root
+        if not root or not root.Parent then
+            -- Root destroyed without a DescendantRemoving event
+            npcCache[model] = nil
+            removeESPBox(model)
+        else
+            local rPos = root.Position
+            local dx   = rPos.X - hPos.X
+            local dy   = rPos.Y - hPos.Y
+            local dz   = rPos.Z - hPos.Z
+            local inRange = (dx*dx + dy*dy + dz*dz) <= range2
+
+            if inRange then
+                local e = espBoxes[model]
+                if not e then
+                    -- Queue creation (capped per tick to spread the cost)
+                    local already = false
+                    for _, m in ipairs(_espCreateQueue) do
+                        if m == model then already = true; break end
+                    end
+                    if not already then
+                        table.insert(_espCreateQueue, model)
+                    end
+                else
+                    e.gui.Enabled = true
+                    if e.lbl then e.lbl.Visible = showTag end
+                end
+            else
+                local e = espBoxes[model]
+                if e and e.gui then e.gui.Enabled = false end
+            end
+        end
+    end
+
+    -- ── Cleanup: destroy boxes for NPCs no longer in cache ────
+    for model in pairs(espBoxes) do
+        if not npcCache[model] then
+            removeESPBox(model)
+        end
+    end
+end
+
 
 local function clearAllESPBoxes()
     for model in pairs(espBoxes) do
@@ -685,9 +869,6 @@ _G.__FlyScript_SetAimlock = setAimlock
 --  RENDER LOOP  (camera + crosshair sync)
 -- ============================================================
 RunService:BindToRenderStep("FlyAimlock", Enum.RenderPriority.Camera.Value + 2, function()
-    -- Box ESP runs every frame regardless of aimlock state
-    updateESPBoxes()
-
     if not S.aimlockEnabled then return end
     if S.aimlockHoldToAim and not Aimlock._holdActive then
         if Aimlock.statusLabel then Aimlock.statusLabel.Text = "" end
@@ -812,6 +993,25 @@ RunService:BindToRenderStep("FlyAimlock", Enum.RenderPriority.Camera.Value + 2, 
         Aimlock.statusLabel.Text = "Locked: " .. t.Name .. tag
     end
 end)
+
+-- ============================================================
+--  ESP HEARTBEAT  (~10 fps — fully off the render thread)
+-- ============================================================
+--  Running ESP on Heartbeat instead of BindToRenderStep means it
+--  can NEVER cause a render-frame drop.  The 0.1 s budget cap also
+--  means even heavy NPC scenes only do one distance-check sweep
+--  ten times a second, not sixty.
+-- ============================================================
+do
+    local _espAccum = 0
+    RunService.Heartbeat:Connect(function(dt)
+        _espAccum = _espAccum + dt
+        if _espAccum < 0.1 then return end   -- ~10 fps
+        _espAccum = 0
+        pcall(updateESPBoxes)                -- pcall isolates any runtime error
+    end)
+end
+
 
 -- ============================================================
 --  KEYBINDS

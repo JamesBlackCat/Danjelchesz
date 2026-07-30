@@ -64,17 +64,14 @@ local D = {
     -- ── Target Mode ───────────────────────────────────────
     targetPlayers             = true,
     targetNPCs                = false,
-    -- ── NPC ESP ───────────────────────────────────────────
+    -- ── NPC ESP (Drawing-based box) ───────────────────────
     espEnabled                = false,
     espDistance               = 500,        -- studs
-    espOutlineTransparency    = 0,          -- 0 = solid outline, 1 = invisible
-    espFillTransparency       = 0.5,        -- 0 = solid fill, 1 = invisible
-    espFillColorR             = 255,
-    espFillColorG             = 30,
-    espFillColorB             = 30,
-    espOutlineColorR          = 255,
-    espOutlineColorG          = 255,
-    espOutlineColorB          = 255,
+    espBoxThickness           = 2,          -- pixels
+    espBoxColorR              = 255,
+    espBoxColorG              = 50,
+    espBoxColorB              = 50,
+    espNameTag                = true,       -- show name above box
     -- ── Images ────────────────────────────────────────────
     aimlockOffImg             = "rbxassetid://124959989742325",
     aimlockOnImg              = "rbxassetid://119279898696244",
@@ -421,118 +418,144 @@ local function switchTarget(dir)
 end
 
 -- ============================================================
---  NPC ESP
---  Uses Roblox Highlight instances (GPU-rendered natively).
---  Management loop runs at 0.5 s intervals via Heartbeat timer —
---  Roblox tracks highlight positions at full FPS automatically.
---  Humanoid.Died removes highlights immediately (no polling).
+--  BOX ESP  (Drawing API — zero GPU overhead vs Highlight)
 -- ============================================================
-local espHighlights = {}   -- [model] = { hl = Highlight, deathConn = Connection }
+--  espBoxes[model] = { sq = Drawing<Square>, lbl = Drawing<Text> }
+--  Drawing objects are created once per NPC, reused every frame.
+--  updateESPBoxes() is called from BindToRenderStep — no 0.5 s lag spikes.
+--  clearAllESPBoxes() immediately hides & removes all drawings (instant off).
+-- ============================================================
+local espBoxes = {}
 
--- Forward declarations so the death callback can reference removeESPHighlight
-local removeESPHighlight
-
-removeESPHighlight = function(model)
-    local entry = espHighlights[model]
-    if not entry then return end
-    if entry.deathConn then pcall(function() entry.deathConn:Disconnect() end) end
-    if entry.hl        then pcall(function() entry.hl:Destroy() end) end
-    espHighlights[model] = nil
+local function removeESPBox(model)
+    local e = espBoxes[model]
+    if not e then return end
+    if e.sq  then pcall(function() e.sq:Remove()  end) end
+    if e.lbl then pcall(function() e.lbl:Remove() end) end
+    espBoxes[model] = nil
 end
 
-local function addESPHighlight(model)
-    if espHighlights[model] then
-        -- Already exists — refresh all visual settings in case they changed
-        local hl = espHighlights[model].hl
-        if hl then
-            hl.FillColor           = Color3.fromRGB(S.espFillColorR,    S.espFillColorG,    S.espFillColorB)
-            hl.OutlineColor        = Color3.fromRGB(S.espOutlineColorR, S.espOutlineColorG, S.espOutlineColorB)
-            hl.OutlineTransparency = S.espOutlineTransparency
-            hl.FillTransparency    = S.espFillTransparency
-        end
-        return
-    end
-
-    local hl = Instance.new("Highlight")
-    hl.FillColor           = Color3.fromRGB(S.espFillColorR,    S.espFillColorG,    S.espFillColorB)
-    hl.OutlineColor        = Color3.fromRGB(S.espOutlineColorR, S.espOutlineColorG, S.espOutlineColorB)
-    hl.OutlineTransparency = S.espOutlineTransparency
-    hl.FillTransparency    = S.espFillTransparency
-    hl.DepthMode           = Enum.HighlightDepthMode.AlwaysOnTop
-    hl.Adornee             = model
-    hl.Enabled             = true
-    -- Parent to the model itself — automatically cleaned up when model is destroyed
-    hl.Parent              = model
-
-    -- Immediate removal on death (no polling needed)
-    local hum = model:FindFirstChildWhichIsA("Humanoid")
-    local deathConn
-    if hum then
-        deathConn = hum.Died:Connect(function()
-            removeESPHighlight(model)
-        end)
-    end
-
-    espHighlights[model] = { hl = hl, deathConn = deathConn }
-end
-
-local function clearAllESP()
-    for model in pairs(espHighlights) do
-        removeESPHighlight(model)
+local function clearAllESPBoxes()
+    for model in pairs(espBoxes) do
+        removeESPBox(model)
     end
 end
 
--- Called twice per second from the Heartbeat timer
-local function tickESP()
+-- Called every frame from BindToRenderStep — pure 2D math, no Instance ops
+local function updateESPBoxes()
     if not S.espEnabled then
-        if next(espHighlights) then clearAllESP() end
+        -- ESP off: hide everything and bail out immediately
+        for _, e in pairs(espBoxes) do
+            if e.sq  then e.sq.Visible  = false end
+            if e.lbl then e.lbl.Visible = false end
+        end
         return
     end
 
     local _, hrp = getCharParts()
     if not hrp then return end
 
-    local range2 = S.espDistance * S.espDistance
-    local hx, hy, hz = hrp.Position.X, hrp.Position.Y, hrp.Position.Z
+    local range2  = S.espDistance * S.espDistance
+    local hPos    = hrp.Position
+    local boxCol  = Color3.fromRGB(S.espBoxColorR, S.espBoxColorG, S.espBoxColorB)
+    local seenInCache = {}
 
-    -- Add/update highlights for in-range living NPCs
     for model in pairs(npcCache) do
-        local hum = model:FindFirstChildWhichIsA("Humanoid")
-        if hum and hum.Health > 0 then
+        seenInCache[model] = true
+
+        -- Guard: model might have been destroyed between cache rebuilds
+        if not model.Parent then
+            removeESPBox(model)
+        else
             local root = model.PrimaryPart
                 or model:FindFirstChild("HumanoidRootPart")
                 or model:FindFirstChildWhichIsA("BasePart")
-            if root then
-                local dx = root.Position.X - hx
-                local dy = root.Position.Y - hy
-                local dz = root.Position.Z - hz
-                if (dx*dx + dy*dy + dz*dz) <= range2 then
-                    addESPHighlight(model)
+
+            local hum = model:FindFirstChildWhichIsA("Humanoid")
+            local alive = hum and hum.Health > 0
+
+            if root and alive then
+                local rPos = root.Position
+                local dx, dy, dz = rPos.X - hPos.X, rPos.Y - hPos.Y, rPos.Z - hPos.Z
+                local inRange = (dx*dx + dy*dy + dz*dz) <= range2
+
+                if inRange then
+                    -- Lazily create Drawing objects (no alloc cost every frame)
+                    if not espBoxes[model] then
+                        local sq  = Drawing.new("Square")
+                        sq.Filled      = false
+                        sq.Color       = boxCol
+                        sq.Thickness   = S.espBoxThickness
+                        sq.Transparency = 1
+                        sq.Visible     = false
+
+                        local lbl = Drawing.new("Text")
+                        lbl.Text        = model.Name
+                        lbl.Size        = 13
+                        lbl.Center      = true
+                        lbl.Outline     = true
+                        lbl.Color       = boxCol
+                        lbl.Transparency = 1
+                        lbl.Visible     = false
+
+                        espBoxes[model] = { sq = sq, lbl = lbl }
+                    end
+
+                    local e = espBoxes[model]
+
+                    -- Project top (head) and bottom (feet) to screen
+                    local headSP = Camera:WorldToViewportPoint(rPos + Vector3.new(0,  2.5, 0))
+                    local feetSP = Camera:WorldToViewportPoint(rPos - Vector3.new(0,  3.0, 0))
+
+                    if headSP.Z > 0 then   -- in front of camera
+                        local topY  = math.min(headSP.Y, feetSP.Y)
+                        local botY  = math.max(headSP.Y, feetSP.Y)
+                        local boxH  = math.max(botY - topY, 4)
+                        local boxW  = boxH * 0.45
+                        local leftX = headSP.X - boxW * 0.5
+
+                        e.sq.Size      = Vector2.new(boxW, boxH)
+                        e.sq.Position  = Vector2.new(leftX, topY)
+                        e.sq.Color     = boxCol
+                        e.sq.Thickness = S.espBoxThickness
+                        e.sq.Visible   = true
+
+                        if e.lbl then
+                            e.lbl.Position    = Vector2.new(headSP.X, topY - 15)
+                            e.lbl.Color       = boxCol
+                            e.lbl.Text        = model.Name
+                            e.lbl.Visible     = S.espNameTag == true
+                        end
+                    else
+                        e.sq.Visible = false
+                        if e.lbl then e.lbl.Visible = false end
+                    end
                 else
-                    removeESPHighlight(model)
+                    -- Out of range — hide (keep object, skip Remove to avoid GC churn)
+                    local e = espBoxes[model]
+                    if e then
+                        e.sq.Visible = false
+                        if e.lbl then e.lbl.Visible = false end
+                    end
+                end
+            else
+                -- Dead or no root — hide
+                local e = espBoxes[model]
+                if e then
+                    e.sq.Visible = false
+                    if e.lbl then e.lbl.Visible = false end
                 end
             end
-        else
-            removeESPHighlight(model)
         end
     end
 
-    -- Clean up stale highlights whose models are no longer in the cache
-    for model in pairs(espHighlights) do
-        if not npcCache[model] then
-            removeESPHighlight(model)
+    -- Remove Drawing objects for models that left the cache since last frame
+    for model in pairs(espBoxes) do
+        if not seenInCache[model] then
+            removeESPBox(model)
         end
     end
 end
-
--- Also remove ESP highlight when a model leaves workspace
--- (piggybacks on the same DescendantRemoving connection via npcCache cleanup,
---  but we still need to destroy the Highlight)
-workspace.DescendantRemoving:Connect(function(obj)
-    if obj:IsA("Model") and espHighlights[obj] then
-        removeESPHighlight(obj)
-    end
-end)
 
 -- ============================================================
 --  CROSSHAIR GUI
@@ -664,6 +687,9 @@ _G.__FlyScript_SetAimlock = setAimlock
 --  RENDER LOOP  (camera + crosshair sync)
 -- ============================================================
 RunService:BindToRenderStep("FlyAimlock", Enum.RenderPriority.Camera.Value + 2, function()
+    -- Box ESP runs every frame regardless of aimlock state
+    updateESPBoxes()
+
     if not S.aimlockEnabled then return end
     if S.aimlockHoldToAim and not Aimlock._holdActive then
         if Aimlock.statusLabel then Aimlock.statusLabel.Text = "" end
@@ -990,22 +1016,13 @@ table.insert(buttonRegistry, { obj = npcBtnObj, sKey = "modeBtnNpcPos" })
 
 refreshModeButtons()
 
--- ── Combined Heartbeat (button visibility + ESP 0.5 s tick) ──
-local _espTick = 0
-RunService.Heartbeat:Connect(function(dt)
-    -- Button visibility
+-- ── Combined Heartbeat (button visibility only) ──────────────
+RunService.Heartbeat:Connect(function()
     switchLeftBtnObj.frame.Visible  = S.switchTargetsEnabled
     switchRightBtnObj.frame.Visible = S.switchTargetsEnabled
     plrBtnObj.frame.Visible         = S._showModeBtns == true
     npcBtnObj.frame.Visible         = S._showModeBtns == true
     aimlockBtnObj.frame.Visible     = true
-
-    -- ESP tick — runs at 0.5 s intervals
-    _espTick = _espTick + dt
-    if _espTick >= 0.5 then
-        _espTick = 0
-        tickESP()
-    end
 end)
 
 -- ── Aimlock button icon hook ───────────────────────────────────
@@ -1244,102 +1261,45 @@ TESP:CreateToggle({ Name = "Enable NPC ESP", CurrentValue = S.espEnabled,
     Flag = "ESPEnabled",
     Callback = function(v)
         S.espEnabled = v
-        if not v then clearAllESP() end
+        -- Immediately destroy all Drawing objects when turning off
+        if not v then clearAllESPBoxes() end
     end })
 
-TESP:CreateSlider({ Name = "Distance  (studs ESP appears)", Range = {50, 2000},
+TESP:CreateSlider({ Name = "Distance  (studs)", Range = {50, 2000},
     Increment = 50, Suffix = " st", CurrentValue = S.espDistance,
     Flag = "ESPDistance",
+    Callback = function(v) S.espDistance = v end })
+
+TESP:CreateSlider({ Name = "Box Thickness  (px)", Range = {1, 5}, Increment = 1,
+    CurrentValue = S.espBoxThickness, Flag = "ESPBoxThickness",
     Callback = function(v)
-        S.espDistance = v
-        -- Update transparencies on existing highlights immediately
-        for _, entry in pairs(espHighlights) do
-            if entry.hl then
-                entry.hl.OutlineTransparency = S.espOutlineTransparency
-                entry.hl.FillTransparency    = S.espFillTransparency
+        S.espBoxThickness = v
+        for _, e in pairs(espBoxes) do
+            if e.sq then e.sq.Thickness = v end
+        end
+    end })
+
+TESP:CreateToggle({ Name = "Show Name Tag", CurrentValue = S.espNameTag,
+    Flag = "ESPNameTag",
+    Callback = function(v)
+        S.espNameTag = v
+        if not v then
+            for _, e in pairs(espBoxes) do
+                if e.lbl then e.lbl.Visible = false end
             end
         end
     end })
 
-TESP:CreateSlider({ Name = "Outline Transparency  (0 = solid, 100 = invisible)",
-    Range = {0, 100}, Increment = 5, Suffix = "%",
-    CurrentValue = math.floor(S.espOutlineTransparency * 100),
-    Flag = "ESPOutlineTransparency",
-    Callback = function(v)
-        S.espOutlineTransparency = v / 100
-        for _, entry in pairs(espHighlights) do
-            if entry.hl then entry.hl.OutlineTransparency = S.espOutlineTransparency end
-        end
-    end })
-
-TESP:CreateSlider({ Name = "Body Transparency  (0 = solid fill, 100 = no fill)",
-    Range = {0, 100}, Increment = 5, Suffix = "%",
-    CurrentValue = math.floor(S.espFillTransparency * 100),
-    Flag = "ESPFillTransparency",
-    Callback = function(v)
-        S.espFillTransparency = v / 100
-        for _, entry in pairs(espHighlights) do
-            if entry.hl then entry.hl.FillTransparency = S.espFillTransparency end
-        end
-    end })
-
-TESP:CreateSection("Fill Color")
-TESP:CreateSlider({ Name = "Fill Color — Red", Range = {0, 255}, Increment = 5,
-    CurrentValue = S.espFillColorR, Flag = "ESPFillR",
-    Callback = function(v)
-        S.espFillColorR = v
-        local c = Color3.fromRGB(S.espFillColorR, S.espFillColorG, S.espFillColorB)
-        for _, entry in pairs(espHighlights) do
-            if entry.hl then entry.hl.FillColor = c end
-        end
-    end })
-TESP:CreateSlider({ Name = "Fill Color — Green", Range = {0, 255}, Increment = 5,
-    CurrentValue = S.espFillColorG, Flag = "ESPFillG",
-    Callback = function(v)
-        S.espFillColorG = v
-        local c = Color3.fromRGB(S.espFillColorR, S.espFillColorG, S.espFillColorB)
-        for _, entry in pairs(espHighlights) do
-            if entry.hl then entry.hl.FillColor = c end
-        end
-    end })
-TESP:CreateSlider({ Name = "Fill Color — Blue", Range = {0, 255}, Increment = 5,
-    CurrentValue = S.espFillColorB, Flag = "ESPFillB",
-    Callback = function(v)
-        S.espFillColorB = v
-        local c = Color3.fromRGB(S.espFillColorR, S.espFillColorG, S.espFillColorB)
-        for _, entry in pairs(espHighlights) do
-            if entry.hl then entry.hl.FillColor = c end
-        end
-    end })
-
-TESP:CreateSection("Outline Color")
-TESP:CreateSlider({ Name = "Outline Color — Red", Range = {0, 255}, Increment = 5,
-    CurrentValue = S.espOutlineColorR, Flag = "ESPOutlineR",
-    Callback = function(v)
-        S.espOutlineColorR = v
-        local c = Color3.fromRGB(S.espOutlineColorR, S.espOutlineColorG, S.espOutlineColorB)
-        for _, entry in pairs(espHighlights) do
-            if entry.hl then entry.hl.OutlineColor = c end
-        end
-    end })
-TESP:CreateSlider({ Name = "Outline Color — Green", Range = {0, 255}, Increment = 5,
-    CurrentValue = S.espOutlineColorG, Flag = "ESPOutlineG",
-    Callback = function(v)
-        S.espOutlineColorG = v
-        local c = Color3.fromRGB(S.espOutlineColorR, S.espOutlineColorG, S.espOutlineColorB)
-        for _, entry in pairs(espHighlights) do
-            if entry.hl then entry.hl.OutlineColor = c end
-        end
-    end })
-TESP:CreateSlider({ Name = "Outline Color — Blue", Range = {0, 255}, Increment = 5,
-    CurrentValue = S.espOutlineColorB, Flag = "ESPOutlineB",
-    Callback = function(v)
-        S.espOutlineColorB = v
-        local c = Color3.fromRGB(S.espOutlineColorR, S.espOutlineColorG, S.espOutlineColorB)
-        for _, entry in pairs(espHighlights) do
-            if entry.hl then entry.hl.OutlineColor = c end
-        end
-    end })
+TESP:CreateSection("Box Color")
+TESP:CreateSlider({ Name = "Box Color — Red", Range = {0, 255}, Increment = 5,
+    CurrentValue = S.espBoxColorR, Flag = "ESPBoxR",
+    Callback = function(v) S.espBoxColorR = v end })
+TESP:CreateSlider({ Name = "Box Color — Green", Range = {0, 255}, Increment = 5,
+    CurrentValue = S.espBoxColorG, Flag = "ESPBoxG",
+    Callback = function(v) S.espBoxColorG = v end })
+TESP:CreateSlider({ Name = "Box Color — Blue", Range = {0, 255}, Increment = 5,
+    CurrentValue = S.espBoxColorB, Flag = "ESPBoxB",
+    Callback = function(v) S.espBoxColorB = v end })
 
 -- ── LOCK LIST ────────────────────────────────────────────────
 local TLL = Window:CreateTab("Lock List", 4483362458)

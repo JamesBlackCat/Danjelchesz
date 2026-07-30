@@ -69,6 +69,12 @@ local D = {
     espDistance               = 500,        -- studs
     espOutlineTransparency    = 0,          -- 0 = solid outline, 1 = invisible
     espFillTransparency       = 0.5,        -- 0 = solid fill, 1 = invisible
+    espFillColorR             = 255,
+    espFillColorG             = 30,
+    espFillColorB             = 30,
+    espOutlineColorR          = 255,
+    espOutlineColorG          = 255,
+    espOutlineColorB          = 255,
     -- ── Images ────────────────────────────────────────────
     aimlockOffImg             = "rbxassetid://124959989742325",
     aimlockOnImg              = "rbxassetid://119279898696244",
@@ -87,59 +93,45 @@ S.ignoreList      = {}
 S.aimlockPartChain = { "Head", "UpperTorso", "Torso", "HumanoidRootPart" }
 
 -- ============================================================
---  NPC CACHE  (event-driven — never calls GetDescendants() at runtime)
+--  NPC CACHE  (background-rebuilt every 0.5 s — never blocks rendering)
 -- ============================================================
---  npcCache[model] = true  for every live non-player Humanoid model
---  Maintained entirely by DescendantAdded / DescendantRemoving events.
+--  npcCache[model] = true  for every living non-player Humanoid model.
+--  A task.spawn loop rebuilds the table in a separate coroutine every 0.5 s
+--  so workspace:GetDescendants() never runs on the render thread.
+--  Walking up the parent chain (not just obj.Parent) catches NPCs whose
+--  Humanoid is nested more than one level inside their model.
 -- ============================================================
 local npcCache = {}      -- [Model] = true
 
--- Build the initial cache once at script load
-local function _buildInitialCache()
+local function rebuildNPCCache()
     local playerChars = {}
     for _, p in ipairs(Players:GetPlayers()) do
         if p.Character then playerChars[p.Character] = true end
     end
+    local fresh = {}
     for _, obj in ipairs(workspace:GetDescendants()) do
-        if obj:IsA("Humanoid") then
+        if obj:IsA("Humanoid") and obj.Health > 0 then
+            -- Walk up to find the nearest Model ancestor (handles nested rigs)
             local model = obj.Parent
-            if model and model:IsA("Model") and not playerChars[model] then
-                npcCache[model] = true
+            while model and not model:IsA("Model") do
+                model = model.Parent
+            end
+            if model and model ~= workspace and not playerChars[model] then
+                fresh[model] = true
             end
         end
     end
+    npcCache = fresh
 end
-_buildInitialCache()
 
--- When any descendant is added, check if it's a Humanoid entering a non-player model
-workspace.DescendantAdded:Connect(function(obj)
-    if not obj:IsA("Humanoid") then return end
-    local model = obj.Parent
-    if not (model and model:IsA("Model")) then return end
-    -- Ensure it's not a player character
-    for _, p in ipairs(Players:GetPlayers()) do
-        if p.Character == model then return end
+rebuildNPCCache()   -- initial synchronous build at load time
+
+-- Subsequent rebuilds run in a background coroutine every 0.5 s
+task.spawn(function()
+    while true do
+        task.wait(0.5)
+        rebuildNPCCache()
     end
-    npcCache[model] = true
-end)
-
--- When a Model is removed, drop it from the cache
-workspace.DescendantRemoving:Connect(function(obj)
-    if obj:IsA("Model") then
-        npcCache[obj] = nil
-    end
-end)
-
--- Player characters should never be treated as NPCs
-local function _excludePlayerChar(char)
-    if char then npcCache[char] = nil end
-end
-for _, p in ipairs(Players:GetPlayers()) do
-    p.CharacterAdded:Connect(_excludePlayerChar)
-    if p.Character then npcCache[p.Character] = nil end
-end
-Players.PlayerAdded:Connect(function(p)
-    p.CharacterAdded:Connect(_excludePlayerChar)
 end)
 
 -- ============================================================
@@ -450,9 +442,11 @@ end
 
 local function addESPHighlight(model)
     if espHighlights[model] then
-        -- Already exists — just refresh transparency in case settings changed
+        -- Already exists — refresh all visual settings in case they changed
         local hl = espHighlights[model].hl
         if hl then
+            hl.FillColor           = Color3.fromRGB(S.espFillColorR,    S.espFillColorG,    S.espFillColorB)
+            hl.OutlineColor        = Color3.fromRGB(S.espOutlineColorR, S.espOutlineColorG, S.espOutlineColorB)
             hl.OutlineTransparency = S.espOutlineTransparency
             hl.FillTransparency    = S.espFillTransparency
         end
@@ -460,8 +454,8 @@ local function addESPHighlight(model)
     end
 
     local hl = Instance.new("Highlight")
-    hl.FillColor           = Color3.fromRGB(255, 30, 30)
-    hl.OutlineColor        = Color3.fromRGB(255, 255, 255)
+    hl.FillColor           = Color3.fromRGB(S.espFillColorR,    S.espFillColorG,    S.espFillColorB)
+    hl.OutlineColor        = Color3.fromRGB(S.espOutlineColorR, S.espOutlineColorG, S.espOutlineColorB)
     hl.OutlineTransparency = S.espOutlineTransparency
     hl.FillTransparency    = S.espFillTransparency
     hl.DepthMode           = Enum.HighlightDepthMode.AlwaysOnTop
@@ -793,17 +787,6 @@ RunService:BindToRenderStep("FlyAimlock", Enum.RenderPriority.Camera.Value + 2, 
         local tag = isOnLockList(t) and " [LIST]" or ""
         Aimlock.statusLabel.Text = "Locked: " .. t.Name .. tag
     end
-end)
-
--- ============================================================
---  HEARTBEAT  (button visibility + ESP tick timer)
--- ============================================================
-local _espTimer = 0
-
-RunService.Heartbeat:Connect(function(dt)
-    -- Button visibility (trivially cheap)
-    switchLeftBtnObj  = switchLeftBtnObj  -- resolved below after button creation
-    switchRightBtnObj = switchRightBtnObj
 end)
 
 -- ============================================================
@@ -1297,6 +1280,64 @@ TESP:CreateSlider({ Name = "Body Transparency  (0 = solid fill, 100 = no fill)",
         S.espFillTransparency = v / 100
         for _, entry in pairs(espHighlights) do
             if entry.hl then entry.hl.FillTransparency = S.espFillTransparency end
+        end
+    end })
+
+TESP:CreateSection("Fill Color")
+TESP:CreateSlider({ Name = "Fill Color — Red", Range = {0, 255}, Increment = 5,
+    CurrentValue = S.espFillColorR, Flag = "ESPFillR",
+    Callback = function(v)
+        S.espFillColorR = v
+        local c = Color3.fromRGB(S.espFillColorR, S.espFillColorG, S.espFillColorB)
+        for _, entry in pairs(espHighlights) do
+            if entry.hl then entry.hl.FillColor = c end
+        end
+    end })
+TESP:CreateSlider({ Name = "Fill Color — Green", Range = {0, 255}, Increment = 5,
+    CurrentValue = S.espFillColorG, Flag = "ESPFillG",
+    Callback = function(v)
+        S.espFillColorG = v
+        local c = Color3.fromRGB(S.espFillColorR, S.espFillColorG, S.espFillColorB)
+        for _, entry in pairs(espHighlights) do
+            if entry.hl then entry.hl.FillColor = c end
+        end
+    end })
+TESP:CreateSlider({ Name = "Fill Color — Blue", Range = {0, 255}, Increment = 5,
+    CurrentValue = S.espFillColorB, Flag = "ESPFillB",
+    Callback = function(v)
+        S.espFillColorB = v
+        local c = Color3.fromRGB(S.espFillColorR, S.espFillColorG, S.espFillColorB)
+        for _, entry in pairs(espHighlights) do
+            if entry.hl then entry.hl.FillColor = c end
+        end
+    end })
+
+TESP:CreateSection("Outline Color")
+TESP:CreateSlider({ Name = "Outline Color — Red", Range = {0, 255}, Increment = 5,
+    CurrentValue = S.espOutlineColorR, Flag = "ESPOutlineR",
+    Callback = function(v)
+        S.espOutlineColorR = v
+        local c = Color3.fromRGB(S.espOutlineColorR, S.espOutlineColorG, S.espOutlineColorB)
+        for _, entry in pairs(espHighlights) do
+            if entry.hl then entry.hl.OutlineColor = c end
+        end
+    end })
+TESP:CreateSlider({ Name = "Outline Color — Green", Range = {0, 255}, Increment = 5,
+    CurrentValue = S.espOutlineColorG, Flag = "ESPOutlineG",
+    Callback = function(v)
+        S.espOutlineColorG = v
+        local c = Color3.fromRGB(S.espOutlineColorR, S.espOutlineColorG, S.espOutlineColorB)
+        for _, entry in pairs(espHighlights) do
+            if entry.hl then entry.hl.OutlineColor = c end
+        end
+    end })
+TESP:CreateSlider({ Name = "Outline Color — Blue", Range = {0, 255}, Increment = 5,
+    CurrentValue = S.espOutlineColorB, Flag = "ESPOutlineB",
+    Callback = function(v)
+        S.espOutlineColorB = v
+        local c = Color3.fromRGB(S.espOutlineColorR, S.espOutlineColorG, S.espOutlineColorB)
+        for _, entry in pairs(espHighlights) do
+            if entry.hl then entry.hl.OutlineColor = c end
         end
     end })
 

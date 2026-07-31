@@ -234,34 +234,15 @@ local function getEntityModel(entity)
     return entity
 end
 
-local function getEntityAimPart(entity)
-    local model = getEntityModel(entity)
-    if not model then return nil end
+-- ── Target Part Rotation  (state + weighted picker) ──────────
+--  playerActiveTP / npcActiveTP: currently-selected aim part.
+--  nil when disabled; refreshed by the Combined Heartbeat timer.
+local playerActiveTP = nil   -- current aim part for Players
+local npcActiveTP    = nil   -- current aim part for NPCs
 
-    -- Target Part Rotation: pick override part if the feature is enabled
-    local partName
-    if entity:IsA("Player") and S.playerTPEnabled and playerActiveTP and playerActiveTP ~= "" then
-        partName = playerActiveTP
-    elseif not entity:IsA("Player") and S.npcTPEnabled and npcActiveTP and npcActiveTP ~= "" then
-        partName = npcActiveTP
-    else
-        partName = (S.aimlockPart and S.aimlockPart ~= "") and S.aimlockPart or nil
-    end
-
--- ============================================================
---  TARGET PART ROTATION  state + weighted picker
--- ============================================================
---  playerActiveTP / npcActiveTP hold the current randomly-
---  selected part name (or nil when disabled / no valid rows).
---  They are refreshed by the Combined Heartbeat timer below.
--- ============================================================
-local playerActiveTP = nil   -- current aim part for Players (nil = use S.aimlockPart)
-local npcActiveTP    = nil   -- current aim part for NPCs    (nil = use S.aimlockPart)
-
--- Reads flat S keys: S[prefix.."1Part"], S[prefix.."1Chance"], ... up to 5
+-- Reads S keys: S[prefix.."1Part"], S[prefix.."1Chance"], ... (up to 5)
 local function pickWeightedPart(prefix)
-    local valid = {}
-    local total = 0
+    local valid, total = {}, 0
     for i = 1, 5 do
         local part   = S[prefix .. i .. "Part"]   or ""
         local chance = S[prefix .. i .. "Chance"] or 0
@@ -270,28 +251,35 @@ local function pickWeightedPart(prefix)
             table.insert(valid, { part = part, w = chance })
         end
     end
-    if total == 0 or #valid == 0 then return nil end
-    local r = math.random() * total
-    local cum = 0
-    for _, entry in ipairs(valid) do
-        cum = cum + entry.w
-        if r <= cum then return entry.part end
+    if total == 0 then return nil end
+    local r, cum = math.random() * total, 0
+    for _, e in ipairs(valid) do
+        cum = cum + e.w
+        if r <= cum then return e.part end
     end
     return valid[#valid].part
 end
 
+local function getEntityAimPart(entity)
+    local model = getEntityModel(entity)
+    if not model then return nil end
+
+    -- Use Target Part Rotation override when enabled
+    local partName
+    if entity:IsA("Player") and S.playerTPEnabled
+            and playerActiveTP and playerActiveTP ~= "" then
+        partName = playerActiveTP
+    elseif not entity:IsA("Player") and S.npcTPEnabled
+            and npcActiveTP and npcActiveTP ~= "" then
+        partName = npcActiveTP
+    else
+        partName = (S.aimlockPart and S.aimlockPart ~= "") and S.aimlockPart or nil
+    end
 
     if partName then
         local p = model:FindFirstChild(partName)
         if p and p:IsA("BasePart") then return p end
     end
-    for _, name in ipairs(S.aimlockPartChain or { "Head", "HumanoidRootPart" }) do
-        local p = model:FindFirstChild(name)
-        if p and p:IsA("BasePart") then return p end
-    end
-    if model:IsA("Model") and model.PrimaryPart then return model.PrimaryPart end
-    return model:FindFirstChildWhichIsA("BasePart")
-end
     for _, name in ipairs(S.aimlockPartChain or { "Head", "HumanoidRootPart" }) do
         local p = model:FindFirstChild(name)
         if p and p:IsA("BasePart") then return p end

@@ -76,6 +76,7 @@ local D = {
     aimlockCrosshairPos       = UDim2.new(0.5, 0, 0.5, 0),
     aimlockCrosshairOpacity   = 0,          -- 0 = fully visible, 1 = invisible
     aimlockCrosshairShape     = "dot",      -- "dot" | "cross"
+    aimlockCrosshairImage     = "",         -- optional rbxassetid/decal ID; blank uses shape
     aimlockCrosshairMoveSpeed = 300,        -- pixels per second while holding an editor arrow
     aimlockKey                = Enum.KeyCode.P,
     aimlockStickyLock         = true,
@@ -165,8 +166,6 @@ S.ignoreList      = {}
 S.aimlockIgnoreTeams = {}
 S.aimlockPartChain = { "Head", "UpperTorso", "Torso", "HumanoidRootPart" }
 S.aimlockFOVRingSize = math.clamp(tonumber(S.aimlockFOVRingSize) or 200, 1, 350)
-S.aimlockCrosshairMoveSpeed = math.clamp(
-    tonumber(S.aimlockCrosshairMoveSpeed) or 300, 10, 2000)
 
 -- ============================================================
 --  NPC CACHE  (event-driven — zero polling, zero GetDescendants spam)
@@ -207,21 +206,25 @@ local function tryAddNPC(model)
     local root = getModelRoot(model)
     if not root then return end
     npcCache[model] = { root = root, hum = hum }
-    -- Remove the entry as soon as health reaches zero. Died is still
-    -- connected as a backup because some NPC controllers do not reliably
-    -- fire both signals.
-    local function invalidateDeadNPC()
+    -- Remove entry the instant the NPC dies (no lag, no polling)
+    hum.Died:Connect(function()
         npcCache[model] = nil
+        -- Remove the visible GUI immediately instead of waiting for the
+        -- next ESP heartbeat.
         local currentRoot = root
         if currentRoot and currentRoot.Parent then
             local gui = currentRoot:FindFirstChild("NPC_ESP")
             if gui then pcall(function() gui:Destroy() end) end
         end
-    end
-    hum.HealthChanged:Connect(function(health)
-        if health <= 0 then invalidateDeadNPC() end
     end)
-    hum.Died:Connect(invalidateDeadNPC)
+end
+
+-- Health can reach zero between the cache pass, the ESP queue, and the
+-- heartbeat that creates the BillboardGui.  Always check at the point of use
+-- so a dead NPC can never receive (or keep) an ESP GUI.
+local function isAliveNPC(model, data)
+    local hum = data and data.hum
+    return model and model.Parent and hum and hum.Parent and hum.Health > 0
 end
 
 -- ── Initial one-time scan (runs only at script load) ─────────
@@ -262,13 +265,12 @@ local Aimlock = {
     crosshairDot    = nil,
     crosshairCrossH = nil,
     crosshairCrossV = nil,
+    crosshairImage  = nil,
     fovCircle       = nil,
     fovStroke       = nil,
     statusLabel     = nil,
     friendCache     = {},
     _holdActive     = false,
-    _autoRotateHumanoid = nil,
-    _autoRotateWas = nil,
 }
 
 -- ── List helpers ──────────────────────────────────────────────
@@ -842,8 +844,8 @@ local function flushCreateQueue(budget)
 
         -- Model may have died between queue and flush — skip if so
         local data = npcCache[model]
-        if data and data.hum and data.hum.Parent and data.hum.Health > 0
-        and data.root and data.root.Parent and not espBoxes[model] then
+        if isAliveNPC(model, data) and data.root and data.root.Parent
+        and not espBoxes[model] then
             local root = data.root
 
             local gui = Instance.new("BillboardGui")
@@ -943,12 +945,7 @@ local function updateESPBoxes()
     -- ── Range + visibility pass over the NPC cache ────────────
     for model, data in pairs(npcCache) do
         local root = data.root
-        if not data.hum or not data.hum.Parent or data.hum.Health <= 0 then
-            -- Health is checked here as well as in the event callback so a
-            -- dead NPC can never receive a queued or already-visible ESP.
-            npcCache[model] = nil
-            removeESPBox(model)
-        elseif not root or not root.Parent then
+        if not isAliveNPC(model, data) or not root or not root.Parent then
             -- Root destroyed without a DescendantRemoving event
             npcCache[model] = nil
             removeESPBox(model)
@@ -998,15 +995,32 @@ end
 --  CROSSHAIR GUI
 -- ============================================================
 local function syncCrosshairShape()
+    local hasImage = type(S.aimlockCrosshairImage) == "string"
+        and S.aimlockCrosshairImage:gsub("%s+", "") ~= ""
     local isCross = S.aimlockCrosshairShape == "cross"
-    if Aimlock.crosshairDot    then Aimlock.crosshairDot.Visible    = not isCross end
-    if Aimlock.crosshairCrossH then Aimlock.crosshairCrossH.Visible = isCross     end
-    if Aimlock.crosshairCrossV then Aimlock.crosshairCrossV.Visible = isCross     end
+    if Aimlock.crosshairImage then Aimlock.crosshairImage.Visible = hasImage end
+    if Aimlock.crosshairDot then Aimlock.crosshairDot.Visible = not hasImage and not isCross end
+    if Aimlock.crosshairCrossH then Aimlock.crosshairCrossH.Visible = not hasImage and isCross end
+    if Aimlock.crosshairCrossV then Aimlock.crosshairCrossV.Visible = not hasImage and isCross end
 end
 
-local function syncCrosshairPreview()
-    if Aimlock.fovCircle then
-        Aimlock.fovCircle.Visible = S.aimlockShowFOV == true
+local function normalizeCrosshairImage(value)
+    local text = tostring(value or ""):gsub("^%s+", ""):gsub("%s+$", "")
+    if text == "" then return "" end
+    local id = text:match("^https?://www%.roblox%.com/asset/%?id=(%d+)")
+        or text:match("^https?://create%.roblox%.com/marketplace/asset/(%d+)")
+        or text:match("^(%d+)$")
+    if id then return "rbxassetid://" .. id end
+    if text:match("^rbxassetid://%d+$") then return text end
+    return text
+end
+
+local function syncCrosshairImage()
+    local image = normalizeCrosshairImage(S.aimlockCrosshairImage)
+    S.aimlockCrosshairImage = image
+    if Aimlock.crosshairImage then
+        Aimlock.crosshairImage.Image = image
+        Aimlock.crosshairImage.ImageTransparency = S.aimlockCrosshairOpacity or 0
     end
     syncCrosshairShape()
 end
@@ -1021,6 +1035,7 @@ local function applyCrosshairPosition(pos)
     if Aimlock.crosshairDot then Aimlock.crosshairDot.Position = normalized end
     if Aimlock.crosshairCrossH then Aimlock.crosshairCrossH.Position = normalized end
     if Aimlock.crosshairCrossV then Aimlock.crosshairCrossV.Position = normalized end
+    if Aimlock.crosshairImage then Aimlock.crosshairImage.Position = normalized end
     if Aimlock.statusLabel then
         Aimlock.statusLabel.Position = UDim2.new(x, 0, y, 28)
     end
@@ -1069,35 +1084,47 @@ local function makeCrosshairGui()
     ds.Thickness = 2; ds.Color = Color3.fromRGB(255,255,255); ds.Transparency = 0.2; ds.Parent = dot
     Aimlock.crosshairDot = dot
 
-    -- Crosshair cross — horizontal bar
+    -- Optional image/decal crosshair.  It replaces either generated shape
+    -- while an ID is present; clearing the setting restores the selected
+    -- dot/cross shape.
+    local image = Instance.new("ImageLabel")
+    image.Name               = "CrosshairImage"
+    image.Size               = UDim2.new(0, 26, 0, 26)
+    image.AnchorPoint        = Vector2.new(0.5, 0.5)
+    image.Position           = S.aimlockCrosshairPos
+    image.BackgroundTransparency = 1
+    image.Image              = normalizeCrosshairImage(S.aimlockCrosshairImage)
+    image.ImageTransparency  = S.aimlockCrosshairOpacity or 0
+    image.ScaleType          = Enum.ScaleType.Fit
+    image.Parent             = sg
+    Aimlock.crosshairImage = image
+
+    -- Crosshair cross — very thin horizontal line
     local crossH = Instance.new("Frame")
     crossH.Name               = "CrosshairCrossH"
-    crossH.Size               = UDim2.new(0, 28, 0, 2)
+    crossH.Size               = UDim2.new(0, 28, 0, 1)
     crossH.AnchorPoint        = Vector2.new(0.5, 0.5)
     crossH.Position           = S.aimlockCrosshairPos
     crossH.BackgroundColor3   = Color3.fromRGB(255, 40, 40)
     crossH.BackgroundTransparency = S.aimlockCrosshairOpacity or 0
     crossH.BorderSizePixel    = 0
     crossH.Parent             = sg
-    local chS = Instance.new("UIStroke")
-    chS.Thickness = 1; chS.Color = Color3.fromRGB(255,255,255); chS.Transparency = 0.35; chS.Parent = crossH
     Aimlock.crosshairCrossH = crossH
 
-    -- Crosshair cross — vertical bar
+    -- Crosshair cross — very thin vertical line
     local crossV = Instance.new("Frame")
     crossV.Name               = "CrosshairCrossV"
-    crossV.Size               = UDim2.new(0, 2, 0, 28)
+    crossV.Size               = UDim2.new(0, 1, 0, 28)
     crossV.AnchorPoint        = Vector2.new(0.5, 0.5)
     crossV.Position           = S.aimlockCrosshairPos
     crossV.BackgroundColor3   = Color3.fromRGB(255, 40, 40)
     crossV.BackgroundTransparency = S.aimlockCrosshairOpacity or 0
     crossV.BorderSizePixel    = 0
     crossV.Parent             = sg
-    local cvS = Instance.new("UIStroke")
-    cvS.Thickness = 1; cvS.Color = Color3.fromRGB(255,255,255); cvS.Transparency = 0.35; cvS.Parent = crossV
     Aimlock.crosshairCrossV = crossV
 
-    syncCrosshairPreview()
+    syncCrosshairShape()
+    syncCrosshairImage()
 
     -- Status label
     local lbl = Instance.new("TextLabel")
@@ -1124,6 +1151,7 @@ local function destroyCrosshairGui()
         Aimlock.crosshairDot    = nil
         Aimlock.crosshairCrossH = nil
         Aimlock.crosshairCrossV = nil
+        Aimlock.crosshairImage  = nil
         Aimlock.fovCircle       = nil
         Aimlock.fovStroke       = nil
         Aimlock.statusLabel     = nil
@@ -1133,22 +1161,8 @@ end
 local function setAimlock(on)
     S.aimlockEnabled = on
     if on then
-        local _, _, hum = getCharParts()
-        if hum then
-            Aimlock._autoRotateHumanoid = hum
-            Aimlock._autoRotateWas = hum.AutoRotate
-            -- Prevent the third-person camera from orbiting/repositioning
-            -- because the humanoid is reacting to our camera correction.
-            hum.AutoRotate = false
-        end
         makeCrosshairGui()
     else
-        if Aimlock._autoRotateHumanoid and Aimlock._autoRotateHumanoid.Parent
-        and Aimlock._autoRotateWas ~= nil then
-            Aimlock._autoRotateHumanoid.AutoRotate = Aimlock._autoRotateWas
-        end
-        Aimlock._autoRotateHumanoid = nil
-        Aimlock._autoRotateWas = nil
         destroyCrosshairGui()
         Aimlock.target = nil
         Aimlock.targetLostAt = 0
@@ -1182,7 +1196,11 @@ RunService:BindToRenderStep("FlyAimlock", Enum.RenderPriority.Camera.Value + 2, 
         Aimlock.crosshairCrossV.Position           = pos
         Aimlock.crosshairCrossV.BackgroundTransparency = opacity
     end
-    syncCrosshairPreview()
+    if Aimlock.crosshairImage then
+        Aimlock.crosshairImage.Position         = pos
+        Aimlock.crosshairImage.ImageTransparency = opacity
+    end
+    syncCrosshairShape()
 
     -- Sync FOV ring
     if Aimlock.fovCircle then
@@ -1203,15 +1221,8 @@ RunService:BindToRenderStep("FlyAimlock", Enum.RenderPriority.Camera.Value + 2, 
     local missPct = math.clamp(S.aimlockMissChance or 0, 0, 90)
     if missPct > 0 and math.random(1, 100) <= missPct then return end
 
-    local _, hrp, hum = getCharParts()
+    local _, hrp = getCharParts()
     if not hrp then return end
-    if hum then
-        if Aimlock._autoRotateHumanoid ~= hum then
-            Aimlock._autoRotateHumanoid = hum
-            Aimlock._autoRotateWas = hum.AutoRotate
-        end
-        hum.AutoRotate = false
-    end
     local cross = crosshairScreenPos()
 
     -- Humanizer jitter
@@ -1277,10 +1288,6 @@ RunService:BindToRenderStep("FlyAimlock", Enum.RenderPriority.Camera.Value + 2, 
     local pxOffY   = cross.Y - vp.Y * 0.5
     local yawOff   = math.atan(pxOffX / focal)
     local pitchOff = math.atan(pxOffY / focal)
-    -- Keep the camera position supplied by Roblox's third-person camera, but
-    -- correct only its orientation. This makes the selected world point land
-    -- on the configured crosshair instead of forcing the camera/character
-    -- into a feedback loop.
     local targetCF = lookCF * CFrame.Angles(pitchOff, yawOff, 0)
     local smooth   = math.clamp(S.aimlockSmoothing or 1, 0.05, 1)
     local newCF    = Camera.CFrame:Lerp(targetCF, smooth)
@@ -1621,6 +1628,7 @@ end
 -- moves the crosshair directly; Move Position mode uses four directional
 -- controls for precise placement.
 local crosshairEditActive = false
+local syncCrosshairEditorVisual = nil
 
 local function enterCrosshairEditMode()
     if crosshairEditActive then return end
@@ -1650,21 +1658,14 @@ local function enterCrosshairEditMode()
         connections = {}
     end
 
-    local heldDirections = { up = false, down = false, left = false, right = false }
-    local function clearHeldDirections()
-        for direction in pairs(heldDirections) do
-            heldDirections[direction] = false
-        end
-    end
-
     local function finish(commit)
-        clearHeldDirections()
         disconnectAll()
         if overlay then overlay:Destroy() end
         crosshairEditActive = false
         if not commit then
             applyCrosshairPosition(originalPos)
         end
+        syncCrosshairEditorVisual = nil
         if not hadCrosshairGui and not S.aimlockEnabled then
             destroyCrosshairGui()
         end
@@ -1691,22 +1692,49 @@ local function enterCrosshairEditMode()
     handle.Name = "CrosshairDragHandle"
     handle.AnchorPoint = Vector2.new(0.5, 0.5)
     handle.Size = UDim2.new(0, 64, 0, 64)
-    -- The handle is only an invisible input surface. The real preview
-    -- underneath already shows exactly the configured FOV ring and either
-    -- the dot or the crosshair shape; do not add a second fixed "+" marker.
     handle.BackgroundTransparency = 1
     handle.Text = ""
     handle.ZIndex = 52
     handle.Parent = overlay
-    do
-        local c = Instance.new("UICorner")
-        c.CornerRadius = UDim.new(0.5, 0)
-        c.Parent = handle
-        local s = Instance.new("UIStroke")
-        s.Color = Color3.new(1, 1, 1)
-        s.Thickness = 2
-        s.Parent = handle
-    end
+
+    -- Keep the hit area large for dragging, but mirror the selected
+    -- crosshair instead of drawing a second circle/plus on top of it.
+    local handleDot = Instance.new("Frame")
+    handleDot.Size = UDim2.new(0, 14, 0, 14)
+    handleDot.AnchorPoint = Vector2.new(0.5, 0.5)
+    handleDot.Position = UDim2.new(0.5, 0, 0.5, 0)
+    handleDot.BackgroundColor3 = Color3.fromRGB(255, 80, 80)
+    handleDot.BorderSizePixel = 0
+    handleDot.ZIndex = 53
+    handleDot.Parent = handle
+    do local c = Instance.new("UICorner"); c.CornerRadius = UDim.new(0.5, 0); c.Parent = handleDot end
+
+    local handleCrossH = Instance.new("Frame")
+    handleCrossH.Size = UDim2.new(0, 28, 0, 1)
+    handleCrossH.AnchorPoint = Vector2.new(0.5, 0.5)
+    handleCrossH.Position = UDim2.new(0.5, 0, 0.5, 0)
+    handleCrossH.BackgroundColor3 = Color3.fromRGB(255, 80, 80)
+    handleCrossH.BorderSizePixel = 0
+    handleCrossH.ZIndex = 53
+    handleCrossH.Parent = handle
+
+    local handleCrossV = Instance.new("Frame")
+    handleCrossV.Size = UDim2.new(0, 1, 0, 28)
+    handleCrossV.AnchorPoint = Vector2.new(0.5, 0.5)
+    handleCrossV.Position = UDim2.new(0.5, 0, 0.5, 0)
+    handleCrossV.BackgroundColor3 = Color3.fromRGB(255, 80, 80)
+    handleCrossV.BorderSizePixel = 0
+    handleCrossV.ZIndex = 53
+    handleCrossV.Parent = handle
+
+    local handleImage = Instance.new("ImageLabel")
+    handleImage.Size = UDim2.new(0, 26, 0, 26)
+    handleImage.AnchorPoint = Vector2.new(0.5, 0.5)
+    handleImage.Position = UDim2.new(0.5, 0, 0.5, 0)
+    handleImage.BackgroundTransparency = 1
+    handleImage.ScaleType = Enum.ScaleType.Fit
+    handleImage.ZIndex = 53
+    handleImage.Parent = handle
 
     local function syncHandle()
         local pos = S.aimlockCrosshairPos
@@ -1714,13 +1742,25 @@ local function enterCrosshairEditMode()
     end
     syncHandle()
 
+    local function syncHandleVisual()
+        local image = normalizeCrosshairImage(S.aimlockCrosshairImage)
+        local hasImage = image ~= ""
+        local isCross = S.aimlockCrosshairShape == "cross"
+        handleImage.Image = image
+        handleImage.Visible = hasImage
+        handleDot.Visible = not hasImage and not isCross
+        handleCrossH.Visible = not hasImage and isCross
+        handleCrossV.Visible = not hasImage and isCross
+    end
+    syncCrosshairEditorVisual = syncHandleVisual
+
     local function setMode(nextMode)
-        clearHeldDirections()
         mode = nextMode
         hint.Text = mode == "drag"
             and "Drag mode — drag the crosshair, then save"
             or "Move position mode — use the four arrow buttons"
-        handle.AutoButtonColor = false
+        handle.AutoButtonColor = mode == "drag"
+        syncHandleVisual()
     end
 
     local function nudgePixels(dx, dy)
@@ -1730,18 +1770,6 @@ local function enterCrosshairEditMode()
             pos.Y.Scale, pos.Y.Offset + dy))
         syncHandle()
     end
-
-    table.insert(connections, RunService.RenderStepped:Connect(function(dt)
-        if not crosshairEditActive or mode ~= "move" then return end
-        local dx = (heldDirections.right and 1 or 0)
-            - (heldDirections.left and 1 or 0)
-        local dy = (heldDirections.down and 1 or 0)
-            - (heldDirections.up and 1 or 0)
-        if dx == 0 and dy == 0 then return end
-
-        local distance = math.max(10, S.aimlockCrosshairMoveSpeed or 300) * dt
-        nudgePixels(dx * distance, dy * distance)
-    end))
 
     table.insert(connections, handle.InputBegan:Connect(function(input)
         if mode ~= "drag" then return end
@@ -1776,7 +1804,7 @@ local function enterCrosshairEditMode()
         end
     end))
 
-    local function makeEditorButton(label, position, color, callback)
+    local function makeEditorButton(label, position, color, callback, holdDirection)
         local button = Instance.new("TextButton")
         button.Size = UDim2.new(0.22, 0, 0.055, 0)
         button.Position = position
@@ -1790,38 +1818,29 @@ local function enterCrosshairEditMode()
         local c = Instance.new("UICorner")
         c.CornerRadius = UDim.new(0.3, 0)
         c.Parent = button
+        if holdDirection then
+            local held = false
+            table.insert(connections, button.InputBegan:Connect(function(input)
+                if input.UserInputType == Enum.UserInputType.MouseButton1
+                or input.UserInputType == Enum.UserInputType.Touch then
+                    held = true
+                end
+            end))
+            table.insert(connections, button.InputEnded:Connect(function(input)
+                if input.UserInputType == Enum.UserInputType.MouseButton1
+                or input.UserInputType == Enum.UserInputType.Touch then
+                    held = false
+                end
+            end))
+            table.insert(connections, RunService.Heartbeat:Connect(function(dt)
+                if held and mode == "move" then
+                    local speed = math.max(1, tonumber(S.aimlockCrosshairMoveSpeed) or 300)
+                    nudgePixels(holdDirection.X * speed * dt, holdDirection.Y * speed * dt)
+                end
+            end))
+        end
         button.MouseButton1Click:Connect(callback)
         button.TouchTap:Connect(callback)
-        return button
-    end
-
-    local function makeHoldEditorButton(label, position, color, direction)
-        local button = Instance.new("TextButton")
-        button.Size = UDim2.new(0.22, 0, 0.055, 0)
-        button.Position = position
-        button.BackgroundColor3 = color
-        button.TextColor3 = Color3.new(1, 1, 1)
-        button.Text = label
-        button.TextScaled = true
-        button.Font = Enum.Font.GothamBold
-        button.ZIndex = 51
-        button.Parent = overlay
-        local c = Instance.new("UICorner")
-        c.CornerRadius = UDim.new(0.3, 0)
-        c.Parent = button
-
-        local function isPress(input)
-            return input.UserInputType == Enum.UserInputType.MouseButton1
-                or input.UserInputType == Enum.UserInputType.Touch
-        end
-        table.insert(connections, button.InputBegan:Connect(function(input)
-            if isPress(input) and mode == "move" then
-                heldDirections[direction] = true
-            end
-        end))
-        table.insert(connections, button.InputEnded:Connect(function(input)
-            if isPress(input) then heldDirections[direction] = false end
-        end))
         return button
     end
 
@@ -1831,14 +1850,19 @@ local function enterCrosshairEditMode()
         Color3.fromRGB(55, 100, 190), function() setMode("move") end)
 
     local arrowY = 0.86
-    makeHoldEditorButton("Up", UDim2.new(0.08, 0, arrowY, 0),
-        Color3.fromRGB(70, 70, 70), "up")
-    makeHoldEditorButton("Down", UDim2.new(0.30, 0, arrowY, 0),
-        Color3.fromRGB(70, 70, 70), "down")
-    makeHoldEditorButton("Left", UDim2.new(0.52, 0, arrowY, 0),
-        Color3.fromRGB(70, 70, 70), "left")
-    makeHoldEditorButton("Right", UDim2.new(0.74, 0, arrowY, 0),
-        Color3.fromRGB(70, 70, 70), "right")
+    local function tapNudge(dx, dy)
+        if mode ~= "move" then return end
+        local speed = math.max(1, tonumber(S.aimlockCrosshairMoveSpeed) or 300)
+        nudgePixels(dx * speed * 0.05, dy * speed * 0.05)
+    end
+    makeEditorButton("Up", UDim2.new(0.08, 0, arrowY, 0),
+        Color3.fromRGB(70, 70, 70), function() tapNudge(0, -1) end, Vector2.new(0, -1))
+    makeEditorButton("Down", UDim2.new(0.30, 0, arrowY, 0),
+        Color3.fromRGB(70, 70, 70), function() tapNudge(0, 1) end, Vector2.new(0, 1))
+    makeEditorButton("Left", UDim2.new(0.52, 0, arrowY, 0),
+        Color3.fromRGB(70, 70, 70), function() tapNudge(-1, 0) end, Vector2.new(-1, 0))
+    makeEditorButton("Right", UDim2.new(0.74, 0, arrowY, 0),
+        Color3.fromRGB(70, 70, 70), function() tapNudge(1, 0) end, Vector2.new(1, 0))
 
     makeEditorButton("Save", UDim2.new(0.08, 0, 0.93, 0),
         Color3.fromRGB(30, 160, 60), function() finish(true) end)
@@ -1853,6 +1877,7 @@ local function enterCrosshairEditMode()
         end)
 
     setMode("drag")
+    syncHandleVisual()
 end
 
 -- ============================================================
@@ -2264,6 +2289,7 @@ TVis:CreateToggle({ Name = "Cross Crosshair  (replaces dot with + shape)",
     Callback = function(v)
         S.aimlockCrosshairShape = v and "cross" or "dot"
         syncCrosshairShape()
+        if syncCrosshairEditorVisual then syncCrosshairEditorVisual() end
     end })
 TVis:CreateInput({ Name = "Crosshair X  (0.0 – 1.0, default 0.5)",
     PlaceholderText = "0.5", RemoveTextAfterFocusLost = false, Flag = "CrosshairX",
@@ -2287,6 +2313,20 @@ TVis:CreateButton({
     Name = "Drag Crosshair",
     Callback = function() enterCrosshairEditMode() end,
 })
+TVis:CreateSlider({ Name = "Move Position Speed  (pixels/sec)",
+    Range = {10, 2000}, Increment = 10, Suffix = " px/s",
+    CurrentValue = S.aimlockCrosshairMoveSpeed, Flag = "CrosshairMoveSpeed",
+    Callback = function(v)
+        S.aimlockCrosshairMoveSpeed = math.max(1, v)
+    end })
+TVis:CreateInput({ Name = "Crosshair Image / Decal ID  (blank = selected shape)",
+    PlaceholderText = "Image or decal ID", RemoveTextAfterFocusLost = false,
+    Flag = "CrosshairImage",
+    Callback = function(v)
+        S.aimlockCrosshairImage = normalizeCrosshairImage(v)
+        syncCrosshairImage()
+        if syncCrosshairEditorVisual then syncCrosshairEditorVisual() end
+    end })
 TVis:CreateSlider({ Name = "Crosshair Opacity  (0 = solid, 100 = invisible)",
     Range = {0,100}, Increment = 5, Suffix = "%",
     CurrentValue = math.floor((S.aimlockCrosshairOpacity or 0) * 100),
@@ -2297,6 +2337,7 @@ TVis:CreateSlider({ Name = "Crosshair Opacity  (0 = solid, 100 = invisible)",
         if Aimlock.crosshairDot    then Aimlock.crosshairDot.BackgroundTransparency    = t end
         if Aimlock.crosshairCrossH then Aimlock.crosshairCrossH.BackgroundTransparency = t end
         if Aimlock.crosshairCrossV then Aimlock.crosshairCrossV.BackgroundTransparency = t end
+        if Aimlock.crosshairImage then Aimlock.crosshairImage.ImageTransparency = t end
     end })
 
 -- ── NPC ESP ───────────────────────────────────────────────────
